@@ -1,3 +1,7 @@
+import {WindowOwner} from "./ipc/WindowOwner";
+import {WindowAcpSession, windowError} from "./ipc/WindowAcpSession";
+import {readWindowSnapshot, windowHistoryItems} from "./ipc/WindowSnapshot";
+import {isWindowSocketUnavailable} from "./ipc/WindowTransport";
 import * as acp from "@agentclientprotocol/sdk/unstable";
 import {RequestError, type SessionId, type SessionModeState} from "@agentclientprotocol/sdk/unstable";
 import {CodexEventHandler, type CompletedPlan, failureWasShownAsMessage} from "./CodexEventHandler";
@@ -492,6 +496,10 @@ export interface CodexProcessState {
 }
 
 export class CodexAcpServer {
+    private aaSessionRead = false;
+    private windowOwner: WindowOwner | undefined;
+    private readonly windowSessions = new Map<string, WindowAcpSession>();
+    private readonly windowOpening = new Map<string, WindowAcpSession>();
     private codexAcpClient: CodexAcpClient;
     private readonly connection: AcpClientConnection;
     private readonly mcpServerSignIn: McpServerSignIn;
@@ -764,6 +772,11 @@ export class CodexAcpServer {
         return () => {
             this.mcpSessionStartup.dispose();
             this.clientDelivery.disposeSessionSetups();
+            for (const window of this.windowSessions.values()) window.close();
+            this.windowSessions.clear();
+            for (const window of this.windowOpening.values()) window.close();
+            this.windowOpening.clear();
+            this.windowOwner?.close();
         };
     }
 
@@ -776,6 +789,7 @@ export class CodexAcpServer {
         const release = this.clientDelivery.captureSessionSetupRelease(sessionId);
         return async () => {
             release();
+            this.windowSessions.get(sessionId)?.activate();
             if (!session || this.sessions.get(sessionId) !== session || this.sessionIsClosing(sessionId)) return;
             const router = session.subagents;
             if (!(router instanceof StandardSubagentEventRouter)) return;
@@ -816,6 +830,7 @@ export class CodexAcpServer {
         this.clientInfo = _params.clientInfo ?? null;
         this.clientCapabilities = _params.clientCapabilities ?? null;
         this.initializeRequest = _params;
+        this.aaSessionRead = _params._meta?.["aa/sessionRead"] === 1;
         this.capabilities = ClientCapabilities.from(_params.clientCapabilities);
         this.clientDelivery.reports.compareMeta = this.capabilities.airToolCallContract;
         this.booleanConfigOptionsSupported = clientSupportsBooleanConfigOptions(_params.clientCapabilities);
@@ -879,6 +894,7 @@ export class CodexAcpServer {
         this.clientInfo = params.info;
         this.clientCapabilities = clientCapabilities;
         this.initializeRequest = {clientInfo: params.info};
+        this.aaSessionRead = params._meta?.["aa/sessionRead"] === 1;
         this.capabilities = ClientCapabilities.fromV2(clientCapabilities);
         this.clientDelivery.reports.compareMeta = this.capabilities.airToolCallContract;
         // Boolean config options are baseline on v2, so there is nothing to probe.
@@ -955,6 +971,11 @@ export class CodexAcpServer {
             steering: {
                 supported: true,
             },
+            ...(this.aaSessionRead ? {
+                "aa/sessionRead": 1,
+                ...(process.env["CODEX_ACP_WINDOW_SOCKET"] ? {"aa/windowControl": 1} : {}),
+                ...(process.env["CODEX_ACP_DAEMON_SOCKET"] ? {"aa/sharedDaemon": 1} : {}),
+            } : {}),
             ...(this.capabilities.airClient ? {
                 [JETBRAINS_META_KEY]: {
                     [AIR_META_KEY]: {
@@ -1629,6 +1650,11 @@ export class CodexAcpServer {
         // The new state holds no suggestion, so the old one must drop its result in flight and clear what it published.
         void previous?.promptSuggestions?.clear();
         this.sessions.set(sessionState.sessionId, sessionState);
+        const windowSocket = process.env["CODEX_ACP_WINDOW_SOCKET"];
+        if (this.aaSessionRead && windowSocket && this.codexProcessState !== null) {
+            this.windowOwner ??= new WindowOwner(windowSocket, () => this.codexAcpClient.appServerClient);
+            this.windowOwner.register(sessionState.sessionId);
+        }
         this.clientDelivery.openSession(sessionState.sessionId);
         const v2 = AcpV2Connection.of(this.connection);
         if (v2) {
@@ -1871,7 +1897,76 @@ export class CodexAcpServer {
         return null;
     }
 
+    async windowControl(sessionId: string): Promise<{route: "window" | "shared-daemon" | "unavailable"}> {
+        if (!this.aaSessionRead) return {route: "unavailable"};
+        const path = process.env["CODEX_ACP_WINDOW_SOCKET"];
+        if (this.windowSessions.get(sessionId)?.session.snapshot) return {route: "window"};
+        if (path) {
+            try {
+                if (await readWindowSnapshot(path, sessionId)) return {route: "window"};
+            } catch (error) {
+                // A known window owner whose snapshot cannot be read keeps precedence over the daemon.
+                if (!isWindowSocketUnavailable(error)) return {route: "unavailable"};
+            }
+        }
+        if (process.env["CODEX_ACP_DAEMON_SOCKET"]) {
+            const appServer = this.codexAcpClient.appServerClient;
+            let cursor: string | null = null;
+            do {
+                const page = await appServer.threadLoadedList({cursor, limit: 100});
+                if (page.data.includes(sessionId)) return {route: "shared-daemon"};
+                cursor = page.nextCursor;
+            } while (cursor);
+        }
+        return {route: "unavailable"};
+    }
+
+    private async followWindow(params: {sessionId: string; cwd: string}, replay: boolean): Promise<WindowAcpSession | null> {
+        const path = process.env["CODEX_ACP_WINDOW_SOCKET"];
+        if (!this.aaSessionRead || !path || this.sessions.has(params.sessionId)) return null;
+        const existing = this.windowSessions.get(params.sessionId);
+        if (existing) {
+            if (!await existing.initialize(replay)) throw windowError(new Error("Original Codex window owner is unavailable"));
+            return existing;
+        }
+        const context = {clientCapabilities: this.capabilities, cwd: params.cwd};
+        const window = new WindowAcpSession(path, params.sessionId, params.cwd, this.connection,
+            item => this.createHistoryUpdates(item, context));
+        this.windowOpening.set(params.sessionId, window);
+        try {
+            if (!await window.initialize(replay)) {
+                window.close();
+                return null;
+            }
+            window.models = await this.codexAcpClient.fetchAvailableModels().catch(() => []);
+            if (this.windowOpening.get(params.sessionId) !== window) throw new Error("Codex window setup was closed");
+            this.windowSessions.set(params.sessionId, window);
+            if (!this.setupResponseOrdering) window.activate();
+            return window;
+        } catch (error) {
+            window.close();
+            if (isWindowSocketUnavailable(error)) return null;
+            throw windowError(error);
+        } finally {
+            if (this.windowOpening.get(params.sessionId) === window) this.windowOpening.delete(params.sessionId);
+        }
+    }
+
+    private windowPromptText(prompt: acp.ContentBlock[]): string {
+        if (prompt.some(block => block.type !== "text")) {
+            throw RequestError.invalidParams(undefined, "This Codex window path currently accepts text only");
+        }
+        return prompt.map(block => block.type === "text" ? block.text : "").join("\n");
+    }
+
+    private windowMessageId(meta?: Record<string, unknown> | null): string {
+        const id = meta?.["aa/clientMessageId"];
+        return typeof id === "string" && id ? id : randomUUID();
+    }
+
     async loadSession(params: acp.LoadSessionRequest): Promise<LegacyLoadSessionResponse> {
+        const window = this.aaSessionRead && process.env["CODEX_ACP_WINDOW_SOCKET"] ? await this.followWindow(params, true) : null;
+        if (window) return {configOptions: window.configOptions(window.models)};
         return this.recovery === null
             ? await this.loadSessionOnce(params)
             : await this.recovery.trackOpen(params.sessionId, () => this.loadSessionOnce(params));
@@ -1958,6 +2053,8 @@ export class CodexAcpServer {
     }
 
     async resumeSession(params: WithAcpMcpServers<acp.ResumeSessionRequest>): Promise<LegacyResumeSessionResponse> {
+        const window = this.aaSessionRead && process.env["CODEX_ACP_WINDOW_SOCKET"] ? await this.followWindow(params, false) : null;
+        if (window) return {configOptions: window.configOptions(window.models)};
         return this.withSystemPromptUpdate(params, async () => this.recovery === null
             ? await this.resumeSessionOnce(params)
             : await this.recovery.trackOpen(params.sessionId, () => this.resumeSessionOnce(params)));
@@ -1985,6 +2082,8 @@ export class CodexAcpServer {
     }
 
     async resumeSessionV2(params: acpV2.ResumeSessionRequest): Promise<acpV2.ResumeSessionResponse> {
+        const window = this.aaSessionRead && process.env["CODEX_ACP_WINDOW_SOCKET"] ? await this.followWindow(params, params.replayFrom?.type === "start") : null;
+        if (window) return {configOptions: toV2ConfigOptions(window.configOptions(window.models))};
         const {replayFrom, systemPrompt, ...rest} = params;
         const request = {...rest, systemPrompt: toV1SystemPrompt(systemPrompt)};
         if (replayFrom == null) {
@@ -2045,6 +2144,56 @@ export class CodexAcpServer {
         };
     }
 
+    /** Read persisted history without subscribing or acquiring the thread writer lock. */
+    async readSession(sessionId: string): Promise<{updates: UpdateSessionEvent[]}> {
+        if (!this.aaSessionRead) throw RequestError.methodNotFound("_aa/session/read");
+        const appServer = this.ensureAppServer();
+        if (appServer) await appServer;
+        const windowSocket = process.env["CODEX_ACP_WINDOW_SOCKET"];
+        if (windowSocket) {
+            const snapshot = await readWindowSnapshot(windowSocket, sessionId).catch(() => null);
+            if (snapshot !== null) {
+                const cwd = snapshot.state["cwd"];
+                if (typeof cwd !== "string") throw RequestError.internalError("Codex window snapshot has no working directory");
+                const updates: UpdateSessionEvent[] = [];
+                const title = snapshot.state["title"];
+                if (typeof title === "string" && title) updates.push({sessionUpdate: "session_info_update", title});
+                const context = {clientCapabilities: this.capabilities, cwd};
+                for (const item of windowHistoryItems(snapshot.state)) {
+                    if (item === null || typeof item !== "object" || !("id" in item) || typeof item.id !== "string"
+                        || !("type" in item) || typeof item.type !== "string") continue;
+                    updates.push(...(await this.createHistoryUpdates(item as ThreadItem, context) ?? []));
+                }
+                return {updates};
+            }
+        }
+        return await this.runWithProcessCheck(async () => {
+            const client = this.codexAcpClient.appServerClient;
+            const {thread} = await client.threadRead({threadId: sessionId});
+            const updates: UpdateSessionEvent[] = [];
+            if (thread.name) updates.push({sessionUpdate: "session_info_update", title: thread.name});
+
+            const context = {clientCapabilities: this.capabilities, cwd: thread.cwd};
+            const addItems = async (items: ThreadItem[]) => {
+                for (const item of items) {
+                    updates.push(...await this.createHistoryUpdates(item, context));
+                }
+            };
+            if (thread.ephemeral) return {updates};
+            if (thread.historyMode !== "paginated") {
+                const {thread: history} = await client.threadRead({threadId: sessionId, includeTurns: true});
+                for (const turn of history.turns) await addItems(turn.items);
+            } else {
+                for await (const turns of client.threadTurnPages({
+                    threadId: sessionId, limit: 20, itemsView: "full", sortDirection: "asc",
+                })) {
+                    for (const turn of turns) await addItems(turn.items);
+                }
+            }
+            return {updates};
+        });
+    }
+
     async listSessions(params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
         const appServer = this.ensureAppServer();
         if (appServer) await appServer;
@@ -2071,6 +2220,13 @@ export class CodexAcpServer {
     }
 
     async closeSession(params: acp.CloseSessionRequest): Promise<acp.CloseSessionResponse> {
+        const window = this.windowSessions.get(params.sessionId) ?? this.windowOpening.get(params.sessionId);
+        if (window) {
+            this.windowSessions.delete(params.sessionId);
+            this.windowOpening.delete(params.sessionId);
+            window.close();
+            return {};
+        }
         logger.log("Closing session...", {sessionId: params.sessionId});
         if (!this.hasLocalSession(params.sessionId)) {
             this.finishSessionDelivery(params.sessionId, []);
@@ -2120,6 +2276,7 @@ export class CodexAcpServer {
         } finally {
             if (closeGeneration !== null && this.getSessionGeneration(params.sessionId) === closeGeneration) {
                 this.sessions.delete(params.sessionId);
+                this.windowOwner?.release(params.sessionId);
                 this.asyncQuestions.get(params.sessionId)?.dispose();
                 this.asyncQuestions.delete(params.sessionId);
                 AcpV2Connection.of(this.connection)?.forgetForegroundState(params.sessionId);
@@ -2832,6 +2989,13 @@ export class CodexAcpServer {
     }
 
     async setSessionConfigOption(params: acp.SetSessionConfigOptionRequest): Promise<acp.SetSessionConfigOptionResponse> {
+        const window = this.windowSessions.get(params.sessionId);
+        if (window) {
+            try {
+                const configOptions = await window.configure(params.configId, this.stringConfigValue(params), window.models);
+                return {configOptions};
+            } catch (error) { throw windowError(error); }
+        }
         this.assertInstructionsReady(params.sessionId);
         logger.log("Set session config option requested", {
             sessionId: params.sessionId,
@@ -2849,6 +3013,10 @@ export class CodexAcpServer {
     async setSessionConfigOptionV2(
         params: acpV2.SetSessionConfigOptionRequest,
     ): Promise<acpV2.SetSessionConfigOptionResponse> {
+        if (this.windowSessions.has(params.sessionId)) {
+            const response = await this.setSessionConfigOption(toV1SetSessionConfigOptionRequest(params));
+            return {configOptions: toV2ConfigOptions(response.configOptions)};
+        }
         const option = this.createSessionConfigOptions(this.getSessionState(params.sessionId))
             .find(option => option.id === params.configId);
         if (!option || params.type !== (option.type === "boolean" ? "boolean" : "id")) {
@@ -3093,6 +3261,16 @@ export class CodexAcpServer {
      *     the outcome of starting a legacy fallback turn.
      */
     private async performSteeringRequest(params: SessionSteerRequest): Promise<SessionSteeringResponse> {
+        const window = this.windowSessions.get(params.sessionId);
+        if (window) {
+            if (window.session.snapshot && !window.session.activeTurn()) {
+                return {outcome: "promptRequired", reason: "noRunningTurn"};
+            }
+            try {
+                await window.session.submit(this.windowPromptText(params.prompt), "steer", this.windowMessageId(params._meta));
+                return {outcome: "injected"};
+            } catch (error) { throw windowError(error); }
+        }
         assertPromptContentSupported(params);
         logger.log("Steering session requested", {
             sessionId: params.sessionId,
@@ -4089,7 +4267,7 @@ export class CodexAcpServer {
             .join(" "));
     }
 
-    private async createHistoryUpdates(item: ThreadItem, sessionState: SessionState): Promise<UpdateSessionEvent[]> {
+    private async createHistoryUpdates(item: ThreadItem, sessionState: Pick<SessionState, "clientCapabilities" | "cwd">): Promise<UpdateSessionEvent[]> {
         const renderer = new AcpToolCallRenderer(sessionState.clientCapabilities);
         switch (item.type) {
             case "userMessage":
@@ -4629,6 +4807,14 @@ export class CodexAcpServer {
      * message; a locally handled command has no Codex turn, so it is inserted right away.
      */
     async promptV2(params: acpV2.PromptRequest, signal?: AbortSignal): Promise<acpV2.PromptResponse> {
+        const window = this.windowSessions.get(params.sessionId);
+        if (window) {
+            const messageId = this.windowMessageId(params._meta);
+            try {
+                await window.session.submit(this.windowPromptText(toV1PromptRequest(params).prompt), "start", messageId, signal);
+                return {messageId};
+            } catch (error) { throw windowError(error); }
+        }
         this.assertInstructionsReady(params.sessionId);
         const sessionId = params.sessionId;
         const request = toV1PromptRequest(params);
@@ -4857,6 +5043,16 @@ export class CodexAcpServer {
         insertion?: UserMessageInsertion,
         reservation?: TurnStartReservation,
     ): Promise<acp.PromptResponse> {
+        const window = this.windowSessions.get(params.sessionId);
+        if (window) {
+            try {
+                const accepted = await window.session.submit(this.windowPromptText(params.prompt), "start", this.windowMessageId(params._meta), signal);
+                const ended = await window.session.waitForEnd(accepted, signal);
+                await window.flush();
+                if (ended.status === "failed") throw new RequestError(-32080, "Codex window turn failed");
+                return {stopReason: ended.status === "completed" ? "end_turn" : "cancelled"};
+            } catch (error) { throw windowError(error); }
+        }
         assertPromptContentSupported(params);
         this.assertInstructionsReady(params.sessionId);
         // Callers that need to gate additional checks (closing, canStart) atomically with the
@@ -5009,6 +5205,7 @@ export class CodexAcpServer {
                 permissionContext,
                 activePrompt.interactionSignal,
                 toolCallRenderer,
+                (threadId, method, approval, signal) => this.windowOwner?.offerApproval(threadId, method, approval, signal),
             );
             const elicitationHandler = new CodexElicitationHandler(
                 interactionConnection,
@@ -5740,6 +5937,11 @@ export class CodexAcpServer {
     }
 
     async cancel(params: acp.CancelNotification): Promise<void> {
+        const window = this.windowSessions.get(params.sessionId);
+        if (window) {
+            await window.session.cancel();
+            return;
+        }
         const child = this.subagentAssociations.get(params.sessionId);
         if (child && this.usesStandardSubagents()) {
             const router = this.sessions.get(child.rootSessionId)?.subagents;

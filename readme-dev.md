@@ -14,7 +14,33 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
 - `APP_SERVER_LOGS` - directory for adapter logs.
 - `CODEX_ACP_APP_SERVER_CRASH_LIMIT` - how many crashes of the Codex app-server in the crash window stop its automatic restart (default `5`).
 - `CODEX_ACP_APP_SERVER_CRASH_WINDOW_MS` - the crash window in milliseconds (default `300000`, 5 minutes).
+- `CODEX_ACP_DAEMON_SOCKET` - connect to an existing private Codex App Server Unix socket over WebSocket. Closing the adapter closes its connection to the daemon.
+- `CODEX_ACP_WINDOW_SOCKET` - use a private Codex window IPC socket for snapshots and owner/follower control. Set this to the socket for the Codex home being used.
 - `CODEX_ACP_PROMPT_SUGGESTIONS` - set to `false` to turn off the predicted follow-up prompt for AIR. It costs one extra model call per turn on the session's model, mostly from cached context.
+
+### 只读会话历史
+
+ACP v1 和 v2 客户端可在 `initialize._meta` 提供 `"aa/sessionRead": 1`。适配器在初始化响应的
+`_meta` 返回相同能力后，客户端可调用 `_aa/session/read`，传入 `{sessionId}`，读取
+`{updates}` 中的历史。调用使用 App Server 的只读接口，或者从配置的窗口 IPC 获取快照。
+窗口路径使用 `thread-owner-discovery` v1、`thread-stream-following-changed` v1 与
+`thread-stream-state-changed` v11。窗口不可读时返回 App Server 上已保存的历史。
+
+### 窗口会话控制
+
+客户端协商 `aa/sessionRead` 且适配器配置窗口 socket 时，初始化响应还会带 `"aa/windowControl": 1`。
+连接共享 daemon 时还会带 `"aa/sharedDaemon": 1`。`_aa/session/control {sessionId}` 返回
+`{route: "window" | "shared-daemon" | "unavailable"}`，宿主可在加载前探测同一个 thread。
+标准 `session/load`（v1）或 `session/resume`（v1/v2）先查窗口 owner，再选择跟随或
+App Server 路径。跟随会话支持文本发送、插话、中断、文件与命令审批，以及 owner 提供的模型和推理强度。
+客户端可在 prompt 与 steering 的 `_meta` 附 `"aa/clientMessageId"`，用于与原生用户消息对账。
+
+跟随期间按 owner 和 revision 应用增量，出现缺口会重新取快照。关闭 follower 解除订阅。
+由本适配器启动的 App Server 可以对窗口公布自己加载的会话，处理文本、审批、配置及窗口队列。
+共享 App Server 模式借用已有 daemon，只管理自己的连接。宿主侧 Linux 终止恢复使用单独确认，
+由宿主核对进程和写锁后恢复原 thread。
+
+内部模块和官方窗口方法版本见 [AA 窗口 IPC](docs/aa-window-ipc.md)。
 
 ### Quick start
 

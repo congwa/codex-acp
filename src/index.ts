@@ -13,6 +13,7 @@ import {runLoginCommand} from "./login";
 import {runCodexCli} from "./CodexCli";
 import {prepareCodexHookConfig} from "./CodexHookConfig";
 import {createAcpAgentRouter} from "./AcpAgentRouter";
+import {connectSharedAppServer} from "./ipc/SharedAppServer";
 import type {AcpClientConnection, AcpV2Connection} from "./ACPSessionConnection";
 
 if (process.argv.includes("--version")) {
@@ -37,10 +38,15 @@ if (process.argv[2] === "login") {
             process.exit(1);
         });
 } else {
-    startAcpServer();
+    void startAcpServer().catch(error => {
+        console.error("Codex ACP startup failed:", error instanceof Error ? error.message : error);
+        process.exitCode = 1;
+        process.stdin.pause();
+    });
 }
 
-function startAcpServer() {
+// AA NEXT     → TS 守护进程 ── ACP ──→ 扩展版 codex-acp ── IPC ──→ Codex App／IDE
+async function startAcpServer() {
     const codexPath = process.env["CODEX_PATH"];
     const configString = process.env["CODEX_CONFIG"];
     const authRequestString = process.env["DEFAULT_AUTH_REQUEST"];
@@ -59,6 +65,20 @@ function startAcpServer() {
         authRequest: authRequestString ?? null,
         defaultAuthRequest: defaultAuthRequest ?? null,
     });
+
+    const sharedSocket = process.env["CODEX_ACP_DAEMON_SOCKET"];
+    if (sharedSocket) {
+        const appServer = await connectSharedAppServer(sharedSocket);
+        const client = new CodexAcpClient(new CodexAppServerClient(appServer), hookConfig.sessionConfig, modelProvider);
+        createAcpAgentRouter(connection => new CodexAcpServer(connection, client, defaultAuthRequest))
+            .connect(createJsonStream(process.stdin, process.stdout));
+        process.stdin.once("close", () => appServer.dispose());
+        appServer.onClose(() => {
+            // The daemon is externally managed. Close this adapter so its host can reconnect.
+            process.stdin.destroy();
+        });
+        return;
+    }
 
     const startupState = {
         appServerStartupArgs: hookConfig.appServerStartupArgs,

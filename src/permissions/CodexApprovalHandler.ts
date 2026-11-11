@@ -40,6 +40,9 @@ export class CodexApprovalHandler implements ApprovalHandler {
         private readonly permissionContext: PermissionPromptContext,
         private readonly cancellationSignal: AbortSignal | undefined,
         private readonly renderer: AcpToolCallRenderer,
+        private readonly offerWindowApproval?: (
+            threadId: string, method: string, params: Record<string, unknown>, signal: AbortSignal,
+        ) => Promise<"accept" | "decline" | "cancel"> | undefined,
     ) {}
 
     async handleCommandExecution(
@@ -53,7 +56,7 @@ export class CodexApprovalHandler implements ApprovalHandler {
         }
 
         try {
-            const response = await this.requestPermission({
+            const decision = await this.requestDecision({
                 sessionId: params.threadId,
                 toolCall: this.renderer.renderPermissionToolCall(CommandReporter.permission(
                     authoritativeParams,
@@ -66,8 +69,8 @@ export class CodexApprovalHandler implements ApprovalHandler {
                     params.networkApprovalContext ? CODEX_NETWORK_PERMISSION_TITLE : CODEX_COMMAND_PERMISSION_TITLE,
                     params.reason,
                 ),
-            });
-            return {decision: this.selectedDecision(response, decisions) ?? "cancel"};
+            }, decisions, "item/commandExecution/requestApproval", params);
+            return {decision};
         } catch (error) {
             logger.error("Error requesting command execution permission", error);
             return {decision: "cancel"};
@@ -77,7 +80,7 @@ export class CodexApprovalHandler implements ApprovalHandler {
     async handleFileChange(params: FileChangeRequestApprovalParams): Promise<FileChangeRequestApprovalResponse> {
         const decisions = fileChangeDecisionOptions();
         try {
-            const response = await this.requestPermission({
+            const decision = await this.requestDecision({
                 sessionId: params.threadId,
                 toolCall: this.renderer.renderPermissionToolCall(FileChangeReporter.permission(
                     params,
@@ -89,8 +92,8 @@ export class CodexApprovalHandler implements ApprovalHandler {
                     CODEX_FILE_CHANGE_PERMISSION_TITLE,
                     params.reason,
                 ),
-            });
-            return {decision: this.selectedDecision(response, decisions) ?? "cancel"};
+            }, decisions, "item/fileChange/requestApproval", params);
+            return {decision};
         } catch (error) {
             logger.error("Error requesting file change permission", error);
             return {decision: "cancel"};
@@ -123,8 +126,25 @@ export class CodexApprovalHandler implements ApprovalHandler {
         }
     }
 
-    private requestPermission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
-        const signal = subagentInteractionSignal(request.sessionId, this.cancellationSignal);
+    private async requestDecision<T>(
+        request: acp.RequestPermissionRequest, decisions: DecisionOption<T>[], method: string, params: Record<string, unknown>,
+    ): Promise<T | "cancel"> {
+        const controller = new AbortController();
+        const window = this.offerWindowApproval?.(request.sessionId, method, params, controller.signal);
+        if (!window) return this.selectedDecision(await this.requestPermission(request), decisions) ?? "cancel";
+        try {
+            return await Promise.race([
+                this.requestPermission(request, controller.signal).then(response => this.selectedDecision(response, decisions) ?? "cancel"),
+                window.then(decision => decisions.find(item => item.decision === decision)?.decision ?? "cancel"),
+            ]);
+        } finally {
+            controller.abort();
+        }
+    }
+
+    private requestPermission(request: acp.RequestPermissionRequest, siblingSignal?: AbortSignal): Promise<acp.RequestPermissionResponse> {
+        const promptSignal = subagentInteractionSignal(request.sessionId, this.cancellationSignal);
+        const signal = promptSignal && siblingSignal ? AbortSignal.any([promptSignal, siblingSignal]) : promptSignal ?? siblingSignal;
         return withSubagentUserAction(request.sessionId, () => this.connection.request(
             acp.methods.client.session.requestPermission,
             request,

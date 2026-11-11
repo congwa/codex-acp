@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- ACP 客户端可只读查看、跟随并继续 Codex 窗口里的原会话，也可连接工作设备上已运行的共享 App Server。
+
 ## [2.6.0](https://github.com/agentclientprotocol/codex-acp/compare/v2.5.0...v2.6.0) (2026-11-06)
 
 

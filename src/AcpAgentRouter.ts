@@ -25,6 +25,8 @@ import {
     sessionRenameParamsParser,
 } from "./SessionIndex";
 
+const readSessionParamsParser = z.object({sessionId: z.string().trim().min(1)});
+
 const emptyExtensionParamsParser = z.preprocess(
     (params) => params ?? {},
     z.object({}).passthrough()
@@ -188,6 +190,8 @@ function createRouter(
         .onRequest(acp.methods.agent.session.new, (ctx) => createdSetup(ctx.requestId, () => getAgentForPaths(ctx.params).newSession(ctx.params)))
         .onRequest(acp.methods.agent.session.load, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgentForPaths(ctx.params).loadSession(ctx.params), ctx.signal))
         .onRequest(acp.methods.agent.session.fork, (ctx) => createdSetup(ctx.requestId, () => getAgentForPaths(ctx.params).forkSession(ctx.params)))
+        .onRequest("_aa/session/read", readSessionParamsParser, (ctx) => getAgent().readSession(ctx.params.sessionId))
+        .onRequest("_aa/session/control", readSessionParamsParser, (ctx) => getAgent().windowControl(ctx.params.sessionId))
         .onRequest(acp.methods.agent.session.list, (ctx) => getAgentForPaths({cwd: ctx.params.cwd ?? null}).listSessions(ctx.params))
         .onRequest(acp.methods.agent.session.delete, (ctx) => getAgent(ctx.params).deleteSession(ctx.params))
         .onRequest(acp.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgentForPaths(ctx.params).resumeSession(ctx.params), ctx.signal))
@@ -222,6 +226,8 @@ function createRouter(
         .onRequest(acpV2.methods.agent.initialize, (ctx) => initialize(ctx.requestId, () => getAgent().initializeV2(ctx.params)))
         // No `session/load`: v2 folds it into `session/resume` with `replayFrom`.
         .onRequest(acpV2.methods.agent.session.new, (ctx) => createdSetup(ctx.requestId, () => getAgentForPaths(ctx.params).newSessionV2(ctx.params)))
+        .onRequest("_aa/session/read", readSessionParamsParser, (ctx) => getAgent().readSession(ctx.params.sessionId))
+        .onRequest("_aa/session/control", readSessionParamsParser, (ctx) => getAgent().windowControl(ctx.params.sessionId))
         .onRequest(acpV2.methods.agent.session.list, (ctx) => getAgentForPaths({cwd: ctx.params.cwd ?? null}).listSessions(ctx.params))
         .onRequest(acpV2.methods.agent.session.delete, (ctx) => getAgent(ctx.params).deleteSession(ctx.params))
         .onRequest(acpV2.methods.agent.session.resume, (ctx) => setup(ctx.params.sessionId, ctx.requestId, () => getAgentForPaths(ctx.params).resumeSessionV2(ctx.params), ctx.signal))
